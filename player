@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+import curses
+import math
+import os
+import random
+import shutil
+import signal
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+
+MUSIC_DIR = Path.home() / "Music"
+SUPPORTED_EXTS = {
+    ".mp3",
+    ".flac",
+    ".wav",
+    ".ogg",
+    ".m4a",
+    ".aac",
+    ".opus",
+    ".wma",
+    ".aiff",
+    ".alac",
+}
+
+
+@dataclass
+class Track:
+    path: Path
+    title: str
+    duration: float | None = None
+
+
+class AudioBackend:
+    def __init__(self) -> None:
+        self.process: subprocess.Popen | None = None
+        self.started_at = 0.0
+        self.paused_at: float | None = None
+        self.paused_total = 0.0
+        self.track: Track | None = None
+        self.backend = self._find_backend()
+
+    def _find_backend(self) -> str | None:
+        for name in ("ffplay", "mpv", "vlc", "cvlc", "mpg123", "play"):
+            if shutil.which(name):
+                return name
+        return None
+
+    def play(self, track: Track) -> None:
+        self.stop()
+        if self.backend is None:
+            return
+
+        cmd = self._command_for(track.path)
+        self.process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.track = track
+        self.started_at = time.monotonic()
+        self.paused_at = None
+        self.paused_total = 0.0
+
+    def _command_for(self, path: Path) -> list[str]:
+        assert self.backend is not None
+        file_name = str(path)
+        if self.backend == "ffplay":
+            return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file_name]
+        if self.backend == "mpv":
+            return ["mpv", "--no-video", "--really-quiet", file_name]
+        if self.backend in ("vlc", "cvlc"):
+            return [self.backend, "--intf", "dummy", "--play-and-exit", file_name]
+        if self.backend == "mpg123":
+            return ["mpg123", "-q", file_name]
+        return ["play", "-q", file_name]
+
+    def stop(self) -> None:
+        if self.process and self.process.poll() is None:
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                self.process.wait(timeout=0.8)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.process = None
+        self.track = None
+        self.paused_at = None
+        self.paused_total = 0.0
+
+    def toggle_pause(self) -> None:
+        if not self.process or self.process.poll() is not None:
+            return
+        if self.paused_at is None:
+            try:
+                os.killpg(self.process.pid, signal.SIGSTOP)
+                self.paused_at = time.monotonic()
+            except ProcessLookupError:
+                pass
+        else:
+            try:
+                os.killpg(self.process.pid, signal.SIGCONT)
+                self.paused_total += time.monotonic() - self.paused_at
+                self.paused_at = None
+            except ProcessLookupError:
+                pass
+
+    def is_playing(self) -> bool:
+        return bool(self.process and self.process.poll() is None)
+
+    def finished(self) -> bool:
+        return bool(self.process and self.process.poll() is not None)
+
+    def elapsed(self) -> float:
+        if not self.process:
+            return 0.0
+        frozen = self.paused_at if self.paused_at is not None else time.monotonic()
+        return max(0.0, frozen - self.started_at - self.paused_total)
+
+
+class Visualizer:
+    def __init__(self) -> None:
+        self.particles: list[dict[str, float]] = []
+        self.phase = 0.0
+        self.bars: list[float] = []
+
+    def reseed(self, track: Track | None) -> None:
+        seed = str(track.path if track else time.time())
+        random.seed(seed)
+        self.particles.clear()
+        self.phase = 0.0
+        self.bars = [random.random() for _ in range(40)]
+
+    def draw(self, win: curses.window, top: int, left: int, height: int, width: int, active: bool) -> None:
+        if height < 8 or width < 20:
+            return
+
+        self.phase += 0.11 if active else 0.035
+        beat = (math.sin(self.phase * 2.1) + math.sin(self.phase * 5.4) * 0.45 + 1.35) / 2.8
+        energy = beat if active else 0.16
+
+        spawn = 3 + int(energy * 8) if active else 1
+        cx = left + width // 2
+        cy = top + height // 2
+        for _ in range(spawn):
+            angle = random.random() * math.tau
+            speed = 0.22 + random.random() * (0.8 + energy)
+            self.particles.append(
+                {
+                    "x": float(cx),
+                    "y": float(cy),
+                    "vx": math.cos(angle) * speed * 1.9,
+                    "vy": math.sin(angle) * speed * 0.8,
+                    "life": 1.0,
+                    "kind": random.randrange(3),
+                }
+            )
+
+        next_particles = []
+        for p in self.particles[-360:]:
+            p["x"] += p["vx"]
+            p["y"] += p["vy"]
+            p["vy"] += math.sin(self.phase + p["x"] * 0.03) * 0.012
+            p["life"] -= 0.025 + (0.015 if active else 0.025)
+            if p["life"] > 0 and left < p["x"] < left + width - 1 and top < p["y"] < top + height - 1:
+                next_particles.append(p)
+        self.particles = next_particles
+
+        chars = ("*", "+", ".", "o", "@")
+        for i, p in enumerate(self.particles):
+            y = int(p["y"])
+            x = int(p["x"])
+            if top <= y < top + height and left <= x < left + width:
+                color = 3 + (i % 4)
+                char = chars[min(len(chars) - 1, int((p["life"] + energy) * 2.2))]
+                safe_add(win, y, x, char, curses.color_pair(color) | curses.A_BOLD)
+
+        ring_count = 3
+        for ring in range(ring_count):
+            radius = 2.4 + ring * 3.4 + energy * 4 + (self.phase * (ring + 1.2)) % 5
+            points = max(18, int(radius * 7))
+            for n in range(points):
+                angle = n / points * math.tau
+                wobble = math.sin(angle * 5 + self.phase * 2) * energy
+                x = int(cx + math.cos(angle) * (radius + wobble) * 1.7)
+                y = int(cy + math.sin(angle) * (radius + wobble) * 0.72)
+                if top <= y < top + height and left <= x < left + width:
+                    safe_add(win, y, x, ".", curses.color_pair(5 + ring % 2))
+
+        bar_width = min(width - 4, 52)
+        base_y = top + height - 3
+        start_x = left + max(1, (width - bar_width) // 2)
+        if len(self.bars) != bar_width:
+            self.bars = [random.random() for _ in range(bar_width)]
+        for i in range(bar_width):
+            target = (math.sin(self.phase * 3 + i * 0.37) + 1) / 2
+            target = max(target, random.random() * energy)
+            self.bars[i] = self.bars[i] * 0.72 + target * 0.28
+            h = int(1 + self.bars[i] * energy * min(7, height // 3))
+            for j in range(h):
+                safe_add(win, base_y - j, start_x + i, "▇", curses.color_pair(6) | curses.A_BOLD)
+
+
+def scan_music() -> list[Track]:
+    if not MUSIC_DIR.exists():
+        return []
+    tracks = [
+        Track(path=path, title=path.stem)
+        for path in MUSIC_DIR.rglob("*")
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTS
+    ]
+    tracks.sort(key=lambda track: str(track.path).casefold())
+    return tracks
+
+
+def probe_duration(path: Path) -> float | None:
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=2.5,
+            check=False,
+        )
+        return float(result.stdout.strip())
+    except (ValueError, subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def format_time(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "--:--"
+    seconds = int(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def fit(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    return text[: max(0, width - 1)] + "…" if len(text) > width else text.ljust(width)
+
+
+def safe_add(win: curses.window, y: int, x: int, text: str, attr: int = 0) -> None:
+    try:
+        win.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+
+def init_colors() -> None:
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    default_bg = -1
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        default_bg = curses.COLOR_BLACK
+    pairs = [
+        (1, curses.COLOR_CYAN, default_bg),
+        (2, curses.COLOR_WHITE, curses.COLOR_BLUE),
+        (3, curses.COLOR_MAGENTA, default_bg),
+        (4, curses.COLOR_CYAN, default_bg),
+        (5, curses.COLOR_GREEN, default_bg),
+        (6, curses.COLOR_YELLOW, default_bg),
+        (7, curses.COLOR_BLUE, default_bg),
+    ]
+    for pair_id, fg, bg in pairs:
+        try:
+            curses.init_pair(pair_id, fg, bg)
+        except curses.error:
+            pass
+
+
+def draw_frame(stdscr: curses.window, y: int, x: int, h: int, w: int, title: str = "") -> None:
+    if h < 2 or w < 2:
+        return
+    safe_add(stdscr, y, x, "╭" + "─" * (w - 2) + "╮", curses.color_pair(7))
+    for row in range(y + 1, y + h - 1):
+        safe_add(stdscr, row, x, "│", curses.color_pair(7))
+        safe_add(stdscr, row, x + w - 1, "│", curses.color_pair(7))
+    safe_add(stdscr, y + h - 1, x, "╰" + "─" * (w - 2) + "╯", curses.color_pair(7))
+    if title:
+        safe_add(stdscr, y, x + 2, f" {title} ", curses.color_pair(1) | curses.A_BOLD)
+
+
+def draw_playlist(stdscr: curses.window, tracks: list[Track], selected: int, current: int | None, h: int, w: int) -> None:
+    draw_frame(stdscr, 2, 0, h - 5, w, " ~/Music ")
+    inner_h = h - 7
+    if not tracks:
+        safe_add(stdscr, 5, 3, "Музыка не найдена. Положи mp3/flac/wav/ogg/m4a в ~/Music.", curses.color_pair(6))
+        return
+
+    selected = max(0, min(selected, len(tracks) - 1))
+    offset = max(0, selected - inner_h // 2)
+    offset = min(offset, max(0, len(tracks) - inner_h))
+    for row in range(inner_h):
+        idx = offset + row
+        if idx >= len(tracks):
+            break
+        marker = "▶" if idx == current else " "
+        prefix = f"{marker} {idx + 1:02d}. "
+        text = prefix + tracks[idx].title
+        attr = curses.color_pair(2) | curses.A_BOLD if idx == selected else curses.color_pair(1 if idx == current else 0)
+        safe_add(stdscr, 3 + row, 2, fit(text, w - 4), attr)
+
+
+def draw_status(
+    stdscr: curses.window,
+    backend: AudioBackend,
+    track: Track | None,
+    h: int,
+    w: int,
+    message: str,
+) -> None:
+    elapsed = backend.elapsed()
+    duration = track.duration if track else None
+    if duration is None and track and backend.is_playing():
+        duration = track.duration = probe_duration(track.path)
+
+    if track:
+        progress = min(1.0, elapsed / duration) if duration and duration > 0 else 0.0
+        bar_w = max(10, w - 36)
+        filled = int(bar_w * progress)
+        bar = "█" * filled + "░" * (bar_w - filled)
+        state = "PAUSE" if backend.paused_at is not None else "PLAY"
+        line = f"{state}  {format_time(elapsed)} / {format_time(duration)}  {bar}"
+    else:
+        line = "STOP  --:-- / --:--"
+
+    safe_add(stdscr, h - 3, 1, fit(line, w - 2), curses.color_pair(6) | curses.A_BOLD)
+    controls = "Enter play  Space pause  n/b next/prev  s stop  r rescan  q quit"
+    safe_add(stdscr, h - 2, 1, fit(controls, w - 2), curses.color_pair(1))
+    if message:
+        safe_add(stdscr, h - 1, 1, fit(message, w - 2), curses.color_pair(3) | curses.A_BOLD)
+
+
+def run(stdscr: curses.window) -> None:
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    curses.noecho()
+    curses.cbreak()
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+    init_colors()
+
+    tracks = scan_music()
+    selected = 0
+    current: int | None = None
+    backend = AudioBackend()
+    visualizer = Visualizer()
+    message = "" if backend.backend else "Не найден аудио-бэкенд: установи ffplay/mpv/vlc/mpg123."
+    last_tick = 0.0
+
+    try:
+        while True:
+            now = time.monotonic()
+            if now - last_tick < 1 / 24:
+                time.sleep(0.008)
+                continue
+            last_tick = now
+
+            if backend.finished() and current is not None and tracks:
+                current = (current + 1) % len(tracks)
+                selected = current
+                visualizer.reseed(tracks[current])
+                backend.play(tracks[current])
+
+            key = stdscr.getch()
+            if key != -1:
+                if key in (ord("q"), 27):
+                    break
+                if key in (curses.KEY_UP, ord("k")) and tracks:
+                    selected = (selected - 1) % len(tracks)
+                elif key in (curses.KEY_DOWN, ord("j")) and tracks:
+                    selected = (selected + 1) % len(tracks)
+                elif key in (curses.KEY_NPAGE,):
+                    selected = min(len(tracks) - 1, selected + 8)
+                elif key in (curses.KEY_PPAGE,):
+                    selected = max(0, selected - 8)
+                elif key in (10, 13, curses.KEY_ENTER) and tracks:
+                    current = selected
+                    visualizer.reseed(tracks[current])
+                    backend.play(tracks[current])
+                    message = f"Играет через {backend.backend}: {tracks[current].title}" if backend.backend else message
+                elif key == ord(" "):
+                    backend.toggle_pause()
+                elif key == ord("s"):
+                    backend.stop()
+                    current = None
+                    message = "Остановлено."
+                elif key == ord("n") and tracks:
+                    current = selected = ((current if current is not None else selected) + 1) % len(tracks)
+                    visualizer.reseed(tracks[current])
+                    backend.play(tracks[current])
+                elif key == ord("b") and tracks:
+                    current = selected = ((current if current is not None else selected) - 1) % len(tracks)
+                    visualizer.reseed(tracks[current])
+                    backend.play(tracks[current])
+                elif key == ord("r"):
+                    tracks = scan_music()
+                    selected = min(selected, max(0, len(tracks) - 1))
+                    current = None
+                    backend.stop()
+                    message = f"Обновлено: {len(tracks)} треков."
+
+            h, w = stdscr.getmaxyx()
+            stdscr.erase()
+            if h < 18 or w < 64:
+                safe_add(stdscr, 1, 2, "Увеличь терминал хотя бы до 64x18.", curses.color_pair(6) | curses.A_BOLD)
+                stdscr.refresh()
+                continue
+
+            title = "TERMINAL PLAYER"
+            safe_add(stdscr, 0, 2, title, curses.color_pair(3) | curses.A_BOLD)
+            safe_add(stdscr, 0, w - 21, time.strftime("%H:%M:%S"), curses.color_pair(1))
+
+            left_w = max(30, min(48, w // 2 - 2))
+            right_x = left_w + 1
+            right_w = w - right_x
+            draw_playlist(stdscr, tracks, selected, current, h, left_w)
+            draw_frame(stdscr, 2, right_x, h - 5, right_w, " pulse field ")
+            visualizer.draw(
+                stdscr,
+                3,
+                right_x + 1,
+                h - 7,
+                right_w - 2,
+                backend.is_playing() and backend.paused_at is None,
+            )
+
+            track = tracks[current] if current is not None and current < len(tracks) else None
+            if track:
+                artist_line = fit(track.path.relative_to(MUSIC_DIR).as_posix(), right_w - 4)
+                safe_add(stdscr, 3, right_x + 2, artist_line, curses.color_pair(1) | curses.A_BOLD)
+            draw_status(stdscr, backend, track, h, w, message)
+            stdscr.refresh()
+    finally:
+        backend.stop()
+
+
+def main() -> None:
+    curses.wrapper(run)
+
+
+if __name__ == "__main__":
+    main()
