@@ -25,6 +25,19 @@ SUPPORTED_EXTS = {
     ".alac",
 }
 
+EDIT_MENU = "edit"
+RENAME_MODE = "rename"
+DELETE_CONFIRM = "delete_confirm"
+MODE_MENU = "mode_menu"
+ANIMATION_MENU = "animation_menu"
+NORMAL_MODE = "normal"
+MIX_MODE = "mix"
+PULSE_ANIMATION = "pulse"
+WAVE_ANIMATION = "wave"
+RAIN_ANIMATION = "rain"
+ANIMATIONS = (PULSE_ANIMATION, WAVE_ANIMATION, RAIN_ANIMATION)
+SHUFFLER = random.SystemRandom()
+
 
 @dataclass
 class Track:
@@ -140,13 +153,29 @@ class Visualizer:
         self.phase = 0.0
         self.bars = [random.random() for _ in range(40)]
 
-    def draw(self, win: curses.window, top: int, left: int, height: int, width: int, active: bool) -> None:
+    def draw(
+        self,
+        win: curses.window,
+        top: int,
+        left: int,
+        height: int,
+        width: int,
+        active: bool,
+        animation: str,
+    ) -> None:
         if height < 8 or width < 20:
             return
 
         self.phase += 0.11 if active else 0.035
         beat = (math.sin(self.phase * 2.1) + math.sin(self.phase * 5.4) * 0.45 + 1.35) / 2.8
         energy = beat if active else 0.16
+
+        if animation == WAVE_ANIMATION:
+            self._draw_wave(win, top, left, height, width, energy)
+            return
+        if animation == RAIN_ANIMATION:
+            self._draw_rain(win, top, left, height, width, energy, active)
+            return
 
         spawn = 3 + int(energy * 8) if active else 1
         cx = left + width // 2
@@ -209,6 +238,74 @@ class Visualizer:
             for j in range(h):
                 safe_add(win, base_y - j, start_x + i, "▇", curses.color_pair(6) | curses.A_BOLD)
 
+    def _draw_wave(self, win: curses.window, top: int, left: int, height: int, width: int, energy: float) -> None:
+        mid = top + height // 2
+        layers = (
+            ("~", 1.0, curses.color_pair(4) | curses.A_BOLD),
+            ("=", 0.62, curses.color_pair(5)),
+            (".", 0.34, curses.color_pair(6)),
+        )
+        for char, scale, attr in layers:
+            amplitude = max(2, int(height * 0.24 * energy * scale))
+            for x_offset in range(1, width - 1):
+                phase = self.phase * (2.0 + scale) + x_offset * 0.18
+                y = mid + int(math.sin(phase) * amplitude + math.sin(phase * 0.43) * amplitude * 0.45)
+                if top <= y < top + height:
+                    safe_add(win, y, left + x_offset, char, attr)
+
+        meter_width = min(width - 4, 58)
+        meter_x = left + max(1, (width - meter_width) // 2)
+        floor_y = top + height - 3
+        for i in range(meter_width):
+            pulse = (math.sin(self.phase * 4 + i * 0.31) + 1) / 2
+            height_here = int(1 + pulse * energy * min(8, height // 3))
+            for row in range(height_here):
+                safe_add(win, floor_y - row, meter_x + i, "▆", curses.color_pair(3 + row % 4) | curses.A_BOLD)
+
+    def _draw_rain(
+        self,
+        win: curses.window,
+        top: int,
+        left: int,
+        height: int,
+        width: int,
+        energy: float,
+        active: bool,
+    ) -> None:
+        spawn = 5 + int(energy * 14) if active else 2
+        for _ in range(spawn):
+            self.particles.append(
+                {
+                    "x": float(left + random.randrange(1, max(2, width - 1))),
+                    "y": float(top + 1),
+                    "vx": math.sin(self.phase + random.random()) * 0.12,
+                    "vy": 0.35 + random.random() * (0.95 + energy),
+                    "life": 1.0,
+                    "kind": random.randrange(4),
+                }
+            )
+
+        drops = []
+        chars = ("|", ":", "!", "*")
+        for p in self.particles[-420:]:
+            p["x"] += p["vx"]
+            p["y"] += p["vy"]
+            p["life"] -= 0.012
+            if p["life"] > 0 and p["y"] < top + height - 2:
+                drops.append(p)
+        self.particles = drops
+
+        for idx, p in enumerate(self.particles):
+            x = int(p["x"])
+            y = int(p["y"])
+            if top <= y < top + height and left <= x < left + width:
+                safe_add(win, y, x, chars[int(p["kind"])], curses.color_pair(3 + idx % 4) | curses.A_BOLD)
+
+        splash_y = top + height - 3
+        for x_offset in range(2, width - 2, 2):
+            if random.random() < energy * 0.32:
+                safe_add(win, splash_y, left + x_offset, "_", curses.color_pair(6) | curses.A_BOLD)
+
 
 def scan_music() -> list[Track]:
     if not MUSIC_DIR.exists():
@@ -260,9 +357,67 @@ def fit(text: str, width: int) -> str:
     return text[: max(0, width - 1)] + "…" if len(text) > width else text.ljust(width)
 
 
-def safe_add(win: curses.window, y: int, x: int, text: str, attr: int = 0) -> None:
+def clean_filename(name: str) -> str:
+    cleaned = name.strip().replace("/", "-").replace("\0", "")
+    return " ".join(cleaned.split())
+
+
+def rename_track(track: Track, new_name: str) -> tuple[bool, str, Track | None]:
+    cleaned = clean_filename(new_name)
+    if not cleaned:
+        return False, "Имя не может быть пустым.", None
+
+    candidate = Path(cleaned)
+    if candidate.suffix.lower() in SUPPORTED_EXTS:
+        new_path = track.path.with_name(candidate.name)
+    else:
+        new_path = track.path.with_name(cleaned + track.path.suffix)
+
+    if new_path == track.path:
+        return False, "Имя не изменилось.", None
+    if new_path.exists():
+        return False, "Файл с таким именем уже существует.", None
+
     try:
-        win.addstr(y, x, text, attr)
+        track.path.rename(new_path)
+    except OSError as exc:
+        return False, f"Не удалось переименовать: {exc.strerror or exc}", None
+
+    return True, f"Переименовано: {new_path.name}", Track(path=new_path, title=new_path.stem, duration=track.duration)
+
+
+def delete_track(track: Track) -> tuple[bool, str]:
+    try:
+        track.path.unlink()
+    except OSError as exc:
+        return False, f"Не удалось удалить: {exc.strerror or exc}"
+    return True, f"Удалено: {track.path.name}"
+
+
+def next_track_index(current: int | None, selected: int, count: int, playback_mode: str) -> int:
+    if count <= 0:
+        return 0
+    base = current if current is not None else selected
+    if playback_mode == MIX_MODE and count > 1:
+        choices = [idx for idx in range(count) if idx != base]
+        return SHUFFLER.choice(choices)
+    return (base + 1) % count
+
+
+def previous_track_index(current: int | None, selected: int, count: int) -> int:
+    if count <= 0:
+        return 0
+    base = current if current is not None else selected
+    return (base - 1) % count
+
+
+def safe_add(win: curses.window, y: int, x: int, text: str, attr: int = 0) -> None:
+    max_y, max_x = win.getmaxyx()
+    if y < 0 or y >= max_y or x < 0 or x >= max_x:
+        return
+    clipped_width = max_x - x
+    try:
+        win.addnstr(y, x, text, clipped_width, attr)
     except curses.error:
         pass
 
@@ -332,6 +487,8 @@ def draw_status(
     h: int,
     w: int,
     message: str,
+    playback_mode: str,
+    animation_mode: str,
 ) -> None:
     elapsed = backend.elapsed()
     duration = track.duration if track else None
@@ -348,11 +505,95 @@ def draw_status(
     else:
         line = "STOP  --:-- / --:--"
 
+    line = f"{line}  MODE:{playback_mode.upper()}  ANIM:{animation_mode.upper()}"
     safe_add(stdscr, h - 3, 1, fit(line, w - 2), curses.color_pair(6) | curses.A_BOLD)
-    controls = "Enter play  Space pause  n/b next/prev  s stop  r rescan  q quit"
+    controls = "Enter play  Space pause  E edit  M mode  n/b next/prev  s stop  r rescan  q quit"
     safe_add(stdscr, h - 2, 1, fit(controls, w - 2), curses.color_pair(1))
     if message:
         safe_add(stdscr, h - 1, 1, fit(message, w - 2), curses.color_pair(3) | curses.A_BOLD)
+
+
+def draw_modal(stdscr: curses.window, h: int, w: int, title: str, lines: list[str]) -> None:
+    box_w = min(max(44, max((len(line) for line in lines), default=0) + 6), w - 4)
+    box_h = min(len(lines) + 4, h - 4)
+    y = max(1, (h - box_h) // 2)
+    x = max(2, (w - box_w) // 2)
+    modal = curses.newwin(box_h, box_w, y, x)
+    modal.bkgd(" ", curses.color_pair(0))
+    modal.erase()
+    draw_frame(modal, 0, 0, box_h, box_w, f" {title} ")
+    for idx, line in enumerate(lines[: box_h - 3]):
+        safe_add(modal, 2 + idx, 3, fit(line, box_w - 6), curses.color_pair(1) | curses.A_BOLD)
+    modal.noutrefresh()
+
+
+def handle_edit_key(
+    key: int,
+    mode: str | None,
+    rename_text: str,
+    tracks: list[Track],
+    selected: int,
+    current: int | None,
+    backend: AudioBackend,
+    visualizer: Visualizer,
+) -> tuple[str | None, str, list[Track], int, int | None, str]:
+    message = ""
+    if mode == EDIT_MENU:
+        if key in (ord("q"), 27, ord("e"), ord("E")):
+            return None, rename_text, tracks, selected, current, ""
+        if key in (ord("r"), ord("R")) and tracks:
+            return RENAME_MODE, tracks[selected].title, tracks, selected, current, ""
+        if key in (ord("d"), ord("D")) and tracks:
+            return DELETE_CONFIRM, rename_text, tracks, selected, current, ""
+        return mode, rename_text, tracks, selected, current, ""
+
+    if mode == RENAME_MODE:
+        if key == 27:
+            return EDIT_MENU, "", tracks, selected, current, "Переименование отменено."
+        if key in (10, 13, curses.KEY_ENTER):
+            old_track = tracks[selected]
+            was_current = current == selected
+            current_path = tracks[current].path if current is not None and current < len(tracks) else None
+            if was_current:
+                backend.stop()
+                current = None
+            ok, message, new_track = rename_track(old_track, rename_text)
+            if ok and new_track:
+                tracks[selected] = new_track
+                tracks.sort(key=lambda item: str(item.path).casefold())
+                selected = next((idx for idx, item in enumerate(tracks) if item.path == new_track.path), selected)
+                if was_current:
+                    current = selected
+                    visualizer.reseed(tracks[current])
+                    backend.play(tracks[current])
+                elif current_path is not None:
+                    current = next((idx for idx, item in enumerate(tracks) if item.path == current_path), current)
+            return None, "", tracks, selected, current, message
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            return mode, rename_text[:-1], tracks, selected, current, ""
+        if 32 <= key <= 126 and len(rename_text) < 120:
+            return mode, rename_text + chr(key), tracks, selected, current, ""
+        return mode, rename_text, tracks, selected, current, ""
+
+    if mode == DELETE_CONFIRM:
+        if key in (ord("q"), 27, ord("n"), ord("N")):
+            return EDIT_MENU, rename_text, tracks, selected, current, "Удаление отменено."
+        if key in (ord("y"), ord("Y")) and tracks:
+            deleting_current = current == selected
+            if deleting_current:
+                backend.stop()
+                current = None
+            old_path = tracks[selected].path
+            ok, message = delete_track(tracks[selected])
+            if ok:
+                tracks = [track for track in tracks if track.path != old_path]
+                selected = min(selected, max(0, len(tracks) - 1))
+                if current is not None and current > selected:
+                    current -= 1
+            return None, "", tracks, selected, current, message
+        return mode, rename_text, tracks, selected, current, ""
+
+    return mode, rename_text, tracks, selected, current, ""
 
 
 def run(stdscr: curses.window) -> None:
@@ -373,6 +614,10 @@ def run(stdscr: curses.window) -> None:
     visualizer = Visualizer()
     message = "" if backend.backend else "Не найден аудио-бэкенд: установи ffplay/mpv/vlc/mpg123."
     last_tick = 0.0
+    ui_mode: str | None = None
+    playback_mode = NORMAL_MODE
+    animation_mode = PULSE_ANIMATION
+    rename_text = ""
 
     try:
         while True:
@@ -383,16 +628,60 @@ def run(stdscr: curses.window) -> None:
             last_tick = now
 
             if backend.finished() and current is not None and tracks:
-                current = (current + 1) % len(tracks)
+                current = next_track_index(current, selected, len(tracks), playback_mode)
                 selected = current
                 visualizer.reseed(tracks[current])
                 backend.play(tracks[current])
 
             key = stdscr.getch()
             if key != -1:
-                if key in (ord("q"), 27):
+                if ui_mode == MODE_MENU:
+                    if key in (ord("q"), 27, ord("m"), ord("M")):
+                        ui_mode = None
+                    elif key in (ord("1"), ord("n"), ord("N")):
+                        playback_mode = NORMAL_MODE
+                        ui_mode = None
+                        message = "Mode: normal."
+                    elif key in (ord("2"), ord("x"), ord("X")):
+                        playback_mode = MIX_MODE
+                        ui_mode = None
+                        message = "Mode: mix. Следующие треки будут случайными."
+                    elif key in (ord("3"), ord("a"), ord("A")):
+                        ui_mode = ANIMATION_MENU
+                elif ui_mode == ANIMATION_MENU:
+                    if key in (ord("q"), 27):
+                        ui_mode = MODE_MENU
+                    elif key in (ord("1"), ord("p"), ord("P")):
+                        animation_mode = PULSE_ANIMATION
+                        visualizer.reseed(tracks[current] if current is not None and tracks else None)
+                        ui_mode = MODE_MENU
+                        message = "Animation: pulse."
+                    elif key in (ord("2"), ord("w"), ord("W")):
+                        animation_mode = WAVE_ANIMATION
+                        visualizer.reseed(tracks[current] if current is not None and tracks else None)
+                        ui_mode = MODE_MENU
+                        message = "Animation: wave."
+                    elif key in (ord("3"), ord("r"), ord("R")):
+                        animation_mode = RAIN_ANIMATION
+                        visualizer.reseed(tracks[current] if current is not None and tracks else None)
+                        ui_mode = MODE_MENU
+                        message = "Animation: rain."
+                elif ui_mode:
+                    ui_mode, rename_text, tracks, selected, current, edit_message = handle_edit_key(
+                        key,
+                        ui_mode,
+                        rename_text,
+                        tracks,
+                        selected,
+                        current,
+                        backend,
+                        visualizer,
+                    )
+                    if edit_message:
+                        message = edit_message
+                elif key in (ord("q"), 27):
                     break
-                if key in (curses.KEY_UP, ord("k")) and tracks:
+                elif key in (curses.KEY_UP, ord("k")) and tracks:
                     selected = (selected - 1) % len(tracks)
                 elif key in (curses.KEY_DOWN, ord("j")) and tracks:
                     selected = (selected + 1) % len(tracks)
@@ -412,11 +701,11 @@ def run(stdscr: curses.window) -> None:
                     current = None
                     message = "Остановлено."
                 elif key == ord("n") and tracks:
-                    current = selected = ((current if current is not None else selected) + 1) % len(tracks)
+                    current = selected = next_track_index(current, selected, len(tracks), playback_mode)
                     visualizer.reseed(tracks[current])
                     backend.play(tracks[current])
                 elif key == ord("b") and tracks:
-                    current = selected = ((current if current is not None else selected) - 1) % len(tracks)
+                    current = selected = previous_track_index(current, selected, len(tracks))
                     visualizer.reseed(tracks[current])
                     backend.play(tracks[current])
                 elif key == ord("r"):
@@ -425,6 +714,11 @@ def run(stdscr: curses.window) -> None:
                     current = None
                     backend.stop()
                     message = f"Обновлено: {len(tracks)} треков."
+                elif key in (ord("e"), ord("E")) and tracks:
+                    ui_mode = EDIT_MENU
+                    rename_text = ""
+                elif key in (ord("m"), ord("M")):
+                    ui_mode = MODE_MENU
 
             h, w = stdscr.getmaxyx()
             stdscr.erase()
@@ -449,14 +743,89 @@ def run(stdscr: curses.window) -> None:
                 h - 7,
                 right_w - 2,
                 backend.is_playing() and backend.paused_at is None,
+                animation_mode,
             )
 
             track = tracks[current] if current is not None and current < len(tracks) else None
             if track:
                 artist_line = fit(track.path.relative_to(MUSIC_DIR).as_posix(), right_w - 4)
                 safe_add(stdscr, 3, right_x + 2, artist_line, curses.color_pair(1) | curses.A_BOLD)
-            draw_status(stdscr, backend, track, h, w, message)
-            stdscr.refresh()
+            draw_status(stdscr, backend, track, h, w, message, playback_mode, animation_mode)
+            stdscr.noutrefresh()
+            if ui_mode == EDIT_MENU and tracks:
+                draw_modal(
+                    stdscr,
+                    h,
+                    w,
+                    " Edit track ",
+                    [
+                        tracks[selected].title,
+                        "",
+                        "r  rename file",
+                        "d  delete file",
+                        "Esc/q  close",
+                    ],
+                )
+            elif ui_mode == RENAME_MODE and tracks:
+                draw_modal(
+                    stdscr,
+                    h,
+                    w,
+                    " Rename ",
+                    [
+                        "New file name:",
+                        rename_text + "█",
+                        "",
+                        "Enter  save    Esc  cancel",
+                    ],
+                )
+            elif ui_mode == DELETE_CONFIRM and tracks:
+                draw_modal(
+                    stdscr,
+                    h,
+                    w,
+                    " Delete ",
+                    [
+                        f"Delete this file?",
+                        tracks[selected].path.name,
+                        "",
+                        "y  delete    n/Esc  cancel",
+                    ],
+                )
+            elif ui_mode == MODE_MENU:
+                normal_mark = ">" if playback_mode == NORMAL_MODE else " "
+                mix_mark = ">" if playback_mode == MIX_MODE else " "
+                draw_modal(
+                    stdscr,
+                    h,
+                    w,
+                    " Mode ",
+                    [
+                        f"{normal_mark} 1 / n  normal - по порядку",
+                        f"{mix_mark} 2 / x  mix    - случайный следующий трек",
+                        f"  3 / a  animation - {animation_mode}",
+                        "",
+                        "Esc/q/M  close",
+                    ],
+                )
+            elif ui_mode == ANIMATION_MENU:
+                pulse_mark = ">" if animation_mode == PULSE_ANIMATION else " "
+                wave_mark = ">" if animation_mode == WAVE_ANIMATION else " "
+                rain_mark = ">" if animation_mode == RAIN_ANIMATION else " "
+                draw_modal(
+                    stdscr,
+                    h,
+                    w,
+                    " Animation ",
+                    [
+                        f"{pulse_mark} 1 / p  pulse - частицы и кольца",
+                        f"{wave_mark} 2 / w  wave  - волны и спектр",
+                        f"{rain_mark} 3 / r  rain  - энергетический дождь",
+                        "",
+                        "Esc/q  back",
+                    ],
+                )
+            curses.doupdate()
     finally:
         backend.stop()
 
