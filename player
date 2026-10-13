@@ -374,14 +374,14 @@ def rename_track(track: Track, new_name: str) -> tuple[bool, str, Track | None]:
         new_path = track.path.with_name(cleaned + track.path.suffix)
 
     if new_path == track.path:
-        return False, "Имя не изменилось.", None
+        return False, "Error name", None
     if new_path.exists():
-        return False, "Файл с таким именем уже существует.", None
+        return False, "Фlready exists", None
 
     try:
         track.path.rename(new_path)
     except OSError as exc:
-        return False, f"Не удалось переименовать: {exc.strerror or exc}", None
+        return False, f"Error name: {exc.strerror or exc}", None
 
     return True, f"Переименовано: {new_path.name}", Track(path=new_path, title=new_path.stem, duration=track.duration)
 
